@@ -61,7 +61,7 @@ Audible fails for some reason.
 
 ## Usage(s)
 ```
-bash AAXtoMP3 [-f|--flac] [-o|--opus] [-a|--aac] [-s|--single] [--level <COMPRESSIONLEVEL>] [-c|--chaptered] [-e:mp3] [-e:m4a] [-e:m4b] [-A|--authcode <AUTHCODE>] [-n|--no-clobber] [-t|--target_dir <PATH>] [-C|--complete_dir <PATH>] [-V|--validate] [--use-audible-cli-data]] [-d|--debug] [-h|--help] [--continue <CHAPTERNUMBER>] <AAX/AAXC INPUT_FILES>...
+bash AAXtoMP3 [-f|--flac] [-o|--opus] [-a|--aac] [-s|--single] [--level <COMPRESSIONLEVEL>] [-c|--chaptered] [-e:mp3] [-e:m4a] [-e:m4b] [-A|--authcode <AUTHCODE>] [-n|--no-clobber] [-t|--target_dir <PATH>] [-C|--complete_dir <PATH>] [-V|--validate] [--use-audible-cli-data]] [-d|--debug] [-h|--help] [--version] [--continue <CHAPTERNUMBER>] <AAX/AAXC INPUT_FILES>...
 ```
 or if you want to get guided through the options
 ```
@@ -101,6 +101,7 @@ bash interactiveAAXtoMP3 [-a|--advanced] [-h|--help]
 ## Options for interactiveAAXtoMP3
 * **-a** or **--advanced** Get more options to choose. Not used right now.
 * **-h** or **--help** Get a help prompt.
+* **--version** Report the version of this fork and exit. (Not in upstream — added because upstream's script carried no version string at all, making a v1.3 install indistinguishable from an unreleased master checkout.)
 This script presents you the options you chose last time as default.
 When you get asked for the aax-file you may just drag'n'drop it to the terminal.
 

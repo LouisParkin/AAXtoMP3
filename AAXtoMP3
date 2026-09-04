@@ -2,6 +2,16 @@
 
 
 # ========================================================================
+# Version
+#
+# This is a fork of KrumpetPirate/AAXtoMP3, which was archived in April 2023.
+# Upstream's last release was v1.3 (Sep 2021); 56 further commits landed on its
+# master without ever being released, so "v1.3" and "master" were impossible to
+# tell apart from inside the script. Hence this constant.
+AAXTOMP3_VERSION="2.0.0"
+AAXTOMP3_REPO="https://github.com/LouisParkin/AAXtoMP3"
+
+# ========================================================================
 # Command Line Options
 
 # Usage Synopsis.
@@ -9,7 +19,8 @@ usage=$'\nUsage: AAXtoMP3 [--flac] [--aac] [--opus ] [--single] [--level <COMPRE
 [--chaptered] [-e:mp3] [-e:m4a] [-e:m4b] [--authcode <AUTHCODE>] [--no-clobber]
 [--target_dir <PATH>] [--complete_dir <PATH>] [--validate] [--loglevel <LOGLEVEL>]
 [--keep-author <N>] [--author <AUTHOR>] [--{dir,file,chapter}-naming-scheme <STRING>]  
-[--use-audible-cli-data] [--audible-cli-library-file <LIBRARY_PATH>] [--continue <CHAPTERNUMBER>] {FILES}\n'
+[--use-audible-cli-data] [--audible-cli-library-file <LIBRARY_PATH>] [--continue <CHAPTERNUMBER>]
+[--version] {FILES}\n'
 codec=libmp3lame            # Default encoder.
 extension=mp3               # Default encoder extension.
 level=-1                    # Compression level. Can be given for mp3, flac and opus. -1 = default/not specified.
@@ -100,6 +111,9 @@ while true; do
     --ffprobe-name    ) ffprobeName="$2";                                                shift 2 ;;
                       # Command synopsis.
     -h | --help       ) printf "$usage" $0 ;                                            exit ;;
+                      # Report the version and exit.
+    --version         ) printf 'AAXtoMP3 %s\n%s\nFork of KrumpetPirate/AAXtoMP3 (archived), based on upstream master, post-v1.3.\n' \
+                          "$AAXTOMP3_VERSION" "$AAXTOMP3_REPO" ;                        exit ;;
                       # Standard flag signifying the end of command line processing.
     --                )                                                                 shift; break ;;
                       # Anything else stops command line processing.

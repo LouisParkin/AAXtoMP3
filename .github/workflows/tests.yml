@@ -3,6 +3,7 @@ name: tests
 on:
   push:
     branches: [master]
+    tags: ['v*']
   pull_request:
     branches: [master]
   workflow_dispatch:
@@ -46,3 +47,21 @@ jobs:
 
       - name: Run the test suite
         run: ./tests/test-nested-chapters.sh
+
+      - name: Smoke-test the CLI entry points
+        run: |
+          bash AAXtoMP3 --version
+          bash AAXtoMP3 --help > /dev/null
+          # no arguments must still be an error
+          if bash AAXtoMP3 > /dev/null 2>&1; then
+            echo "expected a non-zero exit with no arguments" >&2
+            exit 1
+          fi
+
+      - name: Version constant must match the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          reported="$(bash AAXtoMP3 --version | head -1 | awk '{print $2}')"
+          echo "tag=$tag reported=$reported"
+          [ "$tag" = "$reported" ] || { echo "AAXTOMP3_VERSION does not match the tag" >&2; exit 1; }
