@@ -1,4 +1,40 @@
 # AAXtoMP3
+
+> ### About this fork
+>
+> [`KrumpetPirate/AAXtoMP3`](https://github.com/KrumpetPirate/AAXtoMP3) was
+> **archived on 23 April 2023** and is read-only. This fork continues it with
+> bug fixes, tests, and tooling for converting an
+> [OpenAudible](https://openaudible.org) library. All upstream work and
+> attribution is preserved; the licence is unchanged (WTFPL).
+>
+> **What is different here**
+>
+> * **Fixed: nested chapters silently dropped audio.** With
+>   `--use-audible-cli-data`, any book whose chapters nest under Parts, Books or
+>   Discs lost everything below the top level — with no warning and a zero exit
+>   status. One real book produced 0.29 h of a declared 18.99 h.
+>   Both the chaptered and `--single` paths now use the same recursive parser.
+>   Full analysis: **[docs/NESTED-CHAPTERS.md](docs/NESTED-CHAPTERS.md)**.
+> * **Fixed: regex metacharacters in a title broke cover-art lookup.** A `+`,
+>   `(` or `[` in the title made `find -regex` match nothing, and the book was
+>   converted with no cover — silently.
+> * **Added: a coverage guard.** If the parsed chapters do not add up to the
+>   declared runtime, you now get a loud warning instead of a quiet truncation.
+> * **Added: a test suite** — `./tests/test-nested-chapters.sh`, 14 cases,
+>   including a regression proof that the old filter loses audio. The tests
+>   extract the jq filter out of `AAXtoMP3` itself so they cannot drift.
+> * **Added: [`openaudible/`](openaudible/)** — tools to convert a library that
+>   OpenAudible has already downloaded, without re-downloading and without
+>   OpenAudible's paid converter. Covers vouchers for AAXC, full-resolution
+>   cover art, duration verification, `<Author>/<Title>/` foldering for Plex,
+>   and splitting multi-work collections into separate books.
+>   Guide: **[docs/OPENAUDIBLE.md](docs/OPENAUDIBLE.md)**.
+>
+> Everything below is upstream's documentation and still applies.
+
+---
+
 The purpose of this software is to convert AAX (or AAXC) files to common MP3, M4A, M4B, flac and ogg formats
 through a basic bash script frontend to FFMPEG.
 
