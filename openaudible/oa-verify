@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Verify a converted OpenAudible library against its source metadata.
+
+For every book directory under --out, sum the real durations of the produced
+files and compare against runtime in books.json. Catches the silent-truncation
+failure mode (nested chapters dropping most of a book) as well as interrupted
+transfers.
+
+    oa-verify [--root DIR] [--out DIR] [--tolerance SECONDS]
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import difflib
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+
+def duration(path: pathlib.Path) -> float:
+    p = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+         "-of", "csv=p=0", f"file:{path}"],
+        capture_output=True, text=True)
+    try:
+        return float(p.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def book_seconds(entry: dict) -> float:
+    if entry.get("seconds"):
+        try:
+            return float(entry["seconds"])
+        except (TypeError, ValueError):
+            pass
+    m = re.match(r"(\d+):(\d{2}):(\d{2})", str(entry.get("duration") or ""))
+    if m:
+        h, mi, s = (int(x) for x in m.groups())
+        return h * 3600 + mi * 60 + s
+    return 0.0
+
+
+def source_file(entry: dict, root: pathlib.Path):
+    """Locate the original AAX for a book.
+
+    books.json durations are rounded to the minute and can drift from the file
+    by a couple of minutes, which produces false "mismatch" reports. The source
+    file is the real ground truth, so prefer it whenever it is still on disk.
+    """
+    fn = entry.get("filename")
+    if not fn:
+        return None
+    aax = root / "aax"
+    if not aax.is_dir():
+        return None
+    for ext in (".aax", ".AAX", ".aaxc", ".AAXC"):
+        p = aax / f"{fn}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def book_dirs(root: pathlib.Path) -> list:
+    """Find directories that actually hold audio.
+
+    The library is arranged <Author>/<Title>/, so book folders are nested one
+    level below the root, but a few may still sit directly at the top.
+    Detecting by content rather than by depth handles both.
+    """
+    exts = (".m4b", ".m4a", ".mp3")
+    found = []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            kids = list(d.iterdir())
+        except OSError:
+            continue
+        if any(f.is_file() and f.suffix.lower() in exts for f in kids):
+            found.append(d)
+        else:
+            stack.extend(k for k in kids if k.is_dir())
+    return sorted(found)
+
+
+def norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def common_prefix(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", type=pathlib.Path,
+                    default=pathlib.Path.home() / "audible-remote")
+    ap.add_argument("--out", type=pathlib.Path,
+                    default=pathlib.Path.home() / "audible-remote" / "Converted")
+    ap.add_argument("--tolerance", type=float, default=90.0,
+                    help="allowed drift in seconds against books.json")
+    ap.add_argument("--source-tolerance", type=float, default=5.0,
+                    help="allowed drift in seconds against the original AAX")
+    args = ap.parse_args()
+
+    books = json.loads((args.root / "books.json").read_text())
+    by_norm = {}
+    for b in books:
+        for key in (b.get("title"), b.get("filename")):
+            if key:
+                by_norm.setdefault(norm(key), b)
+
+    exts = (".m4b", ".m4a", ".mp3")
+    dirs = book_dirs(args.out)
+    if not dirs:
+        print("no converted books found")
+        return 1
+
+    good = bad = unknown = 0
+    problems = []
+
+    for d in dirs:
+        files = sorted(f for f in d.iterdir() if f.suffix.lower() in exts)
+        if not files:
+            problems.append((d.name, "no audio files", 0, 0))
+            bad += 1
+            continue
+        with cf.ThreadPoolExecutor(max_workers=8) as ex:
+            actual = sum(ex.map(duration, files))
+
+        entry = by_norm.get(norm(d.name))
+        if entry is None:
+            # Converted directories are named from the file's own metadata
+            # title, which often differs from OpenAudible's stored title
+            # (subtitle/series wording). An exact prefix relationship is
+            # stronger evidence than a fuzzy ratio and must be tried first:
+            # "The Rest of the Robots: Robot Series" scores 0.786 against
+            # "The Complete Robot - Robot Series" but 0.766 against its own
+            # title, so difflib alone picks the wrong book.
+            key = norm(d.name)
+            if len(key) >= 4:
+                hits = {id(b): b for k, b in by_norm.items()
+                        if k.startswith(key) or key.startswith(k)}
+                if len(hits) == 1:
+                    entry = next(iter(hits.values()))
+            if entry is None:
+                close = difflib.get_close_matches(key, by_norm.keys(), n=1, cutoff=0.72)
+                if close:
+                    entry = by_norm[close[0]]
+            if entry is None:
+                # Album tags sometimes carry marketing copy instead of the
+                # series subtitle, so neither string contains the other; they
+                # still share a long, distinctive opening run.
+                scored: dict = {}
+                for k, b in by_norm.items():
+                    n = common_prefix(key, k)
+                    if n >= 12:
+                        scored.setdefault(n, {})[id(b)] = b
+                if scored:
+                    best = scored[max(scored)]
+                    if len(best) == 1:
+                        entry = next(iter(best.values()))
+        expect, ref, tol = 0.0, "", args.tolerance
+        if entry:
+            src = source_file(entry, args.root)
+            if src:
+                expect, ref, tol = duration(src), "src", args.source_tolerance
+            else:
+                expect, ref = book_seconds(entry), "json"
+        if not expect:
+            print(f"?  {len(files):3d} files  {actual/3600:6.2f}h  (no reference)  {d.name}")
+            unknown += 1
+            continue
+
+        drift = actual - expect
+        if abs(drift) <= tol:
+            print(f"OK {len(files):3d} files  {actual/3600:6.2f}h  [{ref}]  {d.name}")
+            good += 1
+        else:
+            print(f"!! {len(files):3d} files  {actual/3600:6.2f}h  "
+                  f"expected {expect/3600:.2f}h [{ref}]  ({drift/3600:+.2f}h)  {d.name}")
+            problems.append((d.name, "duration mismatch", actual, expect))
+            bad += 1
+
+    print(f"\n{good} ok, {bad} problem(s), {unknown} without reference "
+          f"({len(dirs)} directories)")
+    if problems:
+        print("\nProblems:")
+        for name, why, a, e in problems:
+            print(f"  {name}: {why}" + (f" ({a/3600:.2f}h vs {e/3600:.2f}h)" if e else ""))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

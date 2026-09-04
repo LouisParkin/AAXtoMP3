@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Build an audible-cli style *-chapters.json from a media file's own chapter track.
+
+Why not use audible-cli's downloaded JSON or OpenAudible's books.json? Because for
+books structured as "Part -> chapters" both of those nest the real chapters inside
+a `chapters` array on the Part entry, and AAXtoMP3 only iterates the top level --
+silently dropping most of the book.
+
+An MP4/AAX chapter track cannot nest, so the container is an authoritative FLAT
+source. ffprobe can read it without decrypting the audio.
+
+    oa-chapters MEDIAFILE OUTFILE
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+
+def probe_chapters(path: str) -> list[dict]:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_chapters", "-i", path],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0 and not proc.stdout.strip():
+        raise RuntimeError(proc.stderr.strip()[:400] or "ffprobe failed")
+    return json.loads(proc.stdout or "{}").get("chapters", [])
+
+
+def safe_title(title: str) -> str:
+    """AAXtoMP3 turns chapter titles straight into filenames.
+
+    It strips ':' itself but nothing else, so a title like
+    "Rule 1 / Stand up Straight" creates a bogus path component and the
+    chapter split fails. Normalise the characters that cannot appear in a
+    filename while keeping the title readable.
+    """
+    title = title.replace("/", " - ").replace("\\", " - ")
+    title = re.sub(r'[\x00-\x1f<>:"|?*]', "", title)
+    return re.sub(r"\s+", " ", title).strip(" .") or "Chapter"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mediafile")
+    ap.add_argument("outfile")
+    ap.add_argument("--asin", default="")
+    args = ap.parse_args()
+
+    try:
+        raw = probe_chapters(args.mediafile)
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not raw:
+        print("ERROR: file exposes no chapter track", file=sys.stderr)
+        return 1
+
+    # Build contiguous ms boundaries so sum(length) == runtime exactly.
+    bounds = [round(float(c["start_time"]) * 1000) for c in raw]
+    bounds.append(round(float(raw[-1]["end_time"]) * 1000))
+
+    chapters = []
+    for i, c in enumerate(raw):
+        title = (c.get("tags") or {}).get("title") or f"Chapter {i + 1}"
+        chapters.append({
+            "start_offset_ms": bounds[i],
+            "start_offset_sec": bounds[i] // 1000,
+            "length_ms": bounds[i + 1] - bounds[i],
+            "title": safe_title(title),
+        })
+
+    runtime = bounds[-1]
+    total = sum(c["length_ms"] for c in chapters)
+    if total != runtime:
+        print(f"ERROR: sum {total} != runtime {runtime}", file=sys.stderr)
+        return 1
+    if any(c["length_ms"] <= 0 for c in chapters):
+        print("ERROR: non-positive chapter length", file=sys.stderr)
+        return 1
+
+    doc = {"content_metadata": {"chapter_info": {
+        "brandIntroDurationMs": 0,
+        "brandOutroDurationMs": 0,
+        "chapters": chapters,
+        "is_accurate": True,
+        "runtime_length_ms": runtime,
+        "runtime_length_sec": runtime // 1000,
+    }}}
+    if args.asin:
+        doc["content_metadata"]["content_reference"] = {"asin": args.asin}
+
+    out = pathlib.Path(args.outfile)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(doc, indent=2))
+    print(f"chapters: {len(chapters)} ({runtime / 3600000:.2f}h) -> {out.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

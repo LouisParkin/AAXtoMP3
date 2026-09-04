@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Flatten nested "Part -> subchapter" structures in audible-cli *-chapters.json files.
+#
+# AAXtoMP3 (as of the version in /usr/bin) reads only
+#   .content_metadata.chapter_info.chapters[]
+# and never recurses into .chapters[].chapters[]. For books whose chapter list is
+# nested (Part markers containing the real chapters), that silently drops every
+# nested chapter -- you get a handful of ~15s "Part N" stubs and lose the book.
+#
+# Every chapter, nested or not, already carries an ABSOLUTE start_offset_ms, so
+# flattening and re-sorting is lossless.
+#
+# Usage:
+#   flatten-chapters FILE...            flatten in place (backup -> FILE.orig)
+#   flatten-chapters -n FILE...         dry run, just report
+#   DROP_PART_MARKERS=1 flatten-chapters FILE...
+#                                       also drop the short "Part N" marker
+#                                       entries and extend the preceding chapter
+#                                       over them (no tiny junk output files)
+set -euo pipefail
+
+dry=0
+if [[ ${1:-} == "-n" ]]; then dry=1; shift; fi
+[[ $# -gt 0 ]] || { echo "usage: flatten-chapters [-n] FILE..." >&2; exit 2; }
+
+flatten='
+def flat: [ .[] | ., (if .chapters then (.chapters | flat | .[]) else empty end) ];
+.content_metadata.chapter_info.chapters |=
+  (flat | map(del(.chapters)) | sort_by(.start_offset_ms))
+'
+
+# Remove zero-length-ish "Part" markers by giving their time to the previous
+# chapter, so playback stays gapless and no <60s files are produced.
+drop_markers='
+.content_metadata.chapter_info.chapters |= (
+  reduce .[] as $c ([];
+    if ($c.length_ms < 60000) and (length > 0)
+    then (.[:-1] + [ .[-1] | .length_ms += $c.length_ms ])
+    else . + [$c] end)
+)
+'
+
+for f in "$@"; do
+  if [[ ! -f $f ]]; then echo "skip (not a file): $f" >&2; continue; fi
+
+  nested=$(jq '[.content_metadata.chapter_info.chapters[]? | select(.chapters)] | length' "$f" 2>/dev/null || echo 0)
+  before=$(jq '.content_metadata.chapter_info.chapters | length' "$f" 2>/dev/null || echo 0)
+
+  if [[ ${nested:-0} -eq 0 ]]; then
+    echo "ok       $before chapters, not nested -- $(basename "$f")"
+    continue
+  fi
+
+  tmp=$(mktemp)
+  jq "$flatten" "$f" > "$tmp"
+  [[ ${DROP_PART_MARKERS:-0} == 1 ]] && { jq "$drop_markers" "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"; }
+
+  after=$(jq '.content_metadata.chapter_info.chapters | length' "$tmp")
+  read -r sum runtime < <(jq -r '.content_metadata.chapter_info |
+      "\([.chapters[].length_ms]|add) \(.runtime_length_ms)"' "$tmp")
+
+  if [[ $sum -ne $runtime ]]; then
+    echo "FAIL     $(basename "$f"): chapter sum ${sum}ms != runtime ${runtime}ms -- left untouched" >&2
+    rm -f "$tmp"; continue
+  fi
+
+  if [[ $dry -eq 1 ]]; then
+    echo "WOULD FIX $before -> $after chapters ($(bc <<<"scale=2;$runtime/3600000")h verified) -- $(basename "$f")"
+    rm -f "$tmp"
+  else
+    [[ -f $f.orig ]] || cp -p "$f" "$f.orig"
+    mv "$tmp" "$f"; chmod 644 "$f"
+    echo "FIXED    $before -> $after chapters ($(bc <<<"scale=2;$runtime/3600000")h verified) -- $(basename "$f")"
+  fi
+done

@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Fetch and decrypt an Audible AAXC voucher (key/iv) for a given ASIN.
+
+Writes a JSON file in the exact shape AAXtoMP3 expects:
+    .content_license.license_response.key / .iv
+
+A freshly requested licence decrypts an AAXC file that was downloaded earlier
+(verified against OpenAudible's library), so this avoids re-downloading audio
+just to obtain the key.
+
+    oa-voucher ASIN OUTFILE [--profile PROFILE]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import sys
+
+import audible
+from audible.aescipher import decrypt_voucher_from_licenserequest
+
+LICENSE_BODY = {
+    "supported_media_features": {
+        "codecs": ["mp4a.40.2", "mp4a.40.42"],
+        "drm_types": ["Mpeg", "Adrm"],
+    },
+    "quality": "High",
+    "consumption_type": "Download",
+    "response_groups": "last_position_heard,pdf_url,content_reference,chapter_info",
+}
+
+
+def auth_path(profile: str) -> pathlib.Path:
+    """Resolve a profile's auth file through config.toml.
+
+    The auth file name need not match the profile name: `audible quickstart`
+    writes profile `audible_us` pointing at `audible-us.json`. Honour the
+    config mapping and only fall back to the naive <profile>.json guess.
+    """
+    cfg_dir = pathlib.Path.home() / ".audible"
+    cfg = cfg_dir / "config.toml"
+    if cfg.exists():
+        name = None
+        for line in cfg.read_text().splitlines():
+            line = line.strip()
+            m = re.match(r"\[profile\.(.+)\]", line)
+            if m:
+                name = m.group(1)
+                continue
+            m = re.match(r'auth_file\s*=\s*"(.+)"', line)
+            if m and name == profile:
+                return cfg_dir / m.group(1)
+    return cfg_dir / f"{profile}.json"
+
+
+def default_profile() -> str | None:
+    """Fall back to audible-cli's own primary_profile rather than guessing."""
+    cfg = pathlib.Path.home() / ".audible" / "config.toml"
+    if not cfg.exists():
+        return None
+    profiles = []
+    for line in cfg.read_text().splitlines():
+        line = line.strip()
+        m = re.match(r'primary_profile\s*=\s*"(.+)"', line)
+        if m:
+            return m.group(1)
+        m = re.match(r"\[profile\.(.+)\]", line)
+        if m:
+            profiles.append(m.group(1))
+    return profiles[0] if len(profiles) == 1 else None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("asin")
+    ap.add_argument("outfile")
+    ap.add_argument("--profile", default=None,
+                    help="audible-cli profile; defaults to primary_profile "
+                         "from ~/.audible/config.toml")
+    ap.add_argument("--quality", default="High", choices=["High", "Normal"])
+    args = ap.parse_args()
+
+    profile = args.profile or default_profile()
+    if not profile:
+        print("ERROR: no --profile given and no primary_profile in "
+              "~/.audible/config.toml", file=sys.stderr)
+        return 2
+
+    out = pathlib.Path(args.outfile)
+    if out.exists() and out.stat().st_size > 0:
+        print(f"voucher cached: {out.name}")
+        return 0
+
+    auth_file = auth_path(profile)
+    if not auth_file.exists():
+        print(f"ERROR: no auth file {auth_file}", file=sys.stderr)
+        return 2
+
+    body = dict(LICENSE_BODY, quality=args.quality)
+    auth = audible.Authenticator.from_file(auth_file)
+    try:
+        with audible.Client(auth) as client:
+            lr = client.post(f"content/{args.asin}/licenserequest", body=body)
+        voucher = decrypt_voucher_from_licenserequest(auth, lr)
+    except Exception as exc:  # noqa: BLE001 - surface API/auth errors verbatim
+        print(f"ERROR: licence request failed for {args.asin}: {exc}", file=sys.stderr)
+        return 1
+
+    if not voucher.get("key") or not voucher.get("iv"):
+        print(f"ERROR: voucher for {args.asin} has no key/iv", file=sys.stderr)
+        return 1
+
+    lr["content_license"]["license_response"] = voucher
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(lr, indent=2))
+    out.chmod(0o600)
+    print(f"voucher fetched: {out.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

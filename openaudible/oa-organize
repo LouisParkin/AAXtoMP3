@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Arrange converted audiobooks into <Author>/<Title>/ folders.
+
+Mirrors the layout of the existing SMB share (AudioBooks/<Author>/<Title>/).
+Author names come from books.json, but when the same author already has a
+folder on the share its exact spelling is reused -- the share and books.json
+sometimes order multi-author credits differently ("Arthur Conan Doyle, Stephen
+Fry - introductions" vs "Stephen Fry - introductions, Arthur Conan Doyle"), and
+matching the share avoids creating a near-duplicate folder.
+
+Moves are renames within one filesystem, so this is a metadata-only operation
+even for a 60GB library on a network mount.
+
+    oa-organize [--out DIR] [--dry-run] [--exclude TEXT ...]
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+AUDIO = (".m4b", ".m4a", ".mp3")
+
+# "Stephen Fry - introductions" / "Michael Ford (translator)"
+ROLE = re.compile(r"\s+-\s+.*$")
+PAREN = re.compile(r"\s*\([^)]*\)\s*$")
+# Comma-separated suffixes that belong to the name, not a co-author.
+SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "phd", "md", "dds", "esq"}
+
+
+def primary_author(name: str) -> str:
+    """Reduce a full Audible credit string to its first credited person.
+
+    "Cixin Liu, Ken Liu - translator" -> "Cixin Liu"
+    "Adolf Hitler, Michael Ford (translator)" -> "Adolf Hitler"
+    "Martin Luther King, Jr." -> "Martin Luther King, Jr."   (suffix kept)
+    """
+    parts = [p.strip() for p in name.split(",") if p.strip()]
+    if not parts:
+        return name.strip()
+    out = parts[0]
+    if len(parts) > 1 and re.sub(r"[^a-z]", "", parts[1].lower()) in SUFFIXES:
+        out = f"{out}, {parts[1]}"
+    out = PAREN.sub("", ROLE.sub("", out))
+    return out.strip().strip(",").strip() or name.strip()
+
+
+def book_dirs(root: pathlib.Path) -> list:
+    """Find directories holding audio, at whatever depth they sit.
+
+    Lets this run against a flat set of book folders or an already-organised
+    <Author>/<Title>/ tree, so re-filing is idempotent.
+    """
+    found = []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            kids = list(d.iterdir())
+        except OSError:
+            continue
+        if any(f.is_file() and f.suffix.lower() in AUDIO for f in kids):
+            found.append(d)
+        else:
+            stack.extend(k for k in kids if k.is_dir())
+    return sorted(found)
+
+
+def norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def common_prefix(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def author_tokens(s: str) -> frozenset:
+    return frozenset(t for t in re.split(r"[^a-z0-9]+", s.lower()) if len(t) > 1)
+
+
+def find_entry(name: str, by_norm: dict):
+    key = norm(name)
+    if key in by_norm:
+        return by_norm[key]
+    if len(key) >= 4:
+        hits = {id(b): b for k, b in by_norm.items()
+                if k.startswith(key) or key.startswith(k)}
+        if len(hits) == 1:
+            return next(iter(hits.values()))
+    close = difflib.get_close_matches(key, by_norm.keys(), n=1, cutoff=0.72)
+    if close:
+        return by_norm[close[0]]
+    scored: dict = {}
+    for k, b in by_norm.items():
+        n = common_prefix(key, k)
+        if n >= 12:
+            scored.setdefault(n, {})[id(b)] = b
+    if scored:
+        best = scored[max(scored)]
+        if len(best) == 1:
+            return next(iter(best.values()))
+    return None
+
+
+def tag_artist(d: pathlib.Path) -> str:
+    """Fall back to the album_artist embedded in the book's own files."""
+    for f in sorted(d.iterdir()):
+        if f.suffix.lower() in AUDIO:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "format_tags=album_artist,artist", "-of", "csv=p=0",
+                 f"file:{f}"], capture_output=True, text=True)
+            parts = [p for p in r.stdout.strip().split(",") if p]
+            if parts:
+                return parts[0]
+            break
+    return ""
+
+
+def safe(name: str) -> str:
+    """Only '/' is illegal on the target filesystem; keep everything else so
+    the result matches the share's existing folder names character for
+    character."""
+    return name.replace("/", "-").strip().rstrip(".") or "Unknown Author"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", type=pathlib.Path,
+                    default=pathlib.Path.home() / "audible-remote")
+    ap.add_argument("--out", type=pathlib.Path, default=None)
+    ap.add_argument("--authors", type=pathlib.Path,
+                    default=pathlib.Path.home() / ".cache" / "smb-authors.txt")
+    ap.add_argument("--exclude", action="append", default=[],
+                    help="skip book directories containing this text")
+    ap.add_argument("--overrides", type=pathlib.Path,
+                    default=pathlib.Path.home() / ".config" / "oa-authors.json",
+                    help="JSON map of ASIN (or normalised title) -> author, "
+                         "applied after all automatic naming")
+    ap.add_argument("--primary-author", action="store_true",
+                    help="file under the first credited author only, "
+                         "collapsing 'X, Y - translator' into 'X'")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    out = args.out or (args.root / "Converted")
+
+    books = json.loads((args.root / "books.json").read_text())
+    by_norm = {}
+    for b in books:
+        for key in (b.get("title"), b.get("filename")):
+            if key:
+                by_norm.setdefault(norm(key), b)
+
+    smb = {}
+    smb_tokens = {}
+    if args.authors.exists():
+        for line in args.authors.read_text().splitlines():
+            line = line.strip()
+            if line:
+                smb[norm(line)] = line
+                smb_tokens.setdefault(author_tokens(line), line)
+
+    overrides = {}
+    overrides_by_title = {}
+    if args.overrides.exists():
+        for k, v in json.loads(args.overrides.read_text()).items():
+            overrides[k] = v
+            overrides_by_title[norm(k)] = v
+
+    moved = skipped = excluded = failed = 0
+    plan = []
+
+    for d in book_dirs(out):
+        if any(x.lower() in d.name.lower() for x in args.exclude):
+            print(f"-- excluded: {d.name}")
+            excluded += 1
+            continue
+
+        entry = find_entry(d.name, by_norm)
+        author = (entry or {}).get("author") or tag_artist(d)
+        if not author:
+            print(f"?  no author for {d.name}")
+            failed += 1
+            continue
+
+        # Prefer the share's own spelling when it already knows this author.
+        exact = smb.get(norm(author))
+        if not exact:
+            # Credits are sometimes listed in a different order on the share
+            # ("Arthur Conan Doyle, Stephen Fry - introductions" vs "Stephen
+            # Fry - introductions, Arthur Conan Doyle"), which no ordered
+            # string comparison will catch -- compare the name tokens instead.
+            exact = smb_tokens.get(author_tokens(author))
+        if not exact:
+            close = difflib.get_close_matches(norm(author), smb.keys(), n=1, cutoff=0.85)
+            if close:
+                exact = smb[close[0]]
+        author = exact or author
+        if args.primary_author:
+            author = primary_author(author)
+        # Manual decisions win over any derived name, and must be applied last
+        # so a later --primary-author run cannot undo them.
+        asin = (entry or {}).get("asin")
+        if asin and asin in overrides:
+            author = overrides[asin]
+        elif norm(d.name) in overrides_by_title:
+            author = overrides_by_title[norm(d.name)]
+        author = safe(author)
+
+        if d.parent.name == author and d.parent.parent == out:
+            skipped += 1
+            continue
+        plan.append((d, author))
+
+    width = max((len(a) for _, a in plan), default=0)
+    for d, author in plan:
+        dest_dir = out / author
+        dest = dest_dir / d.name
+        marker = " (new author)" if norm(author) not in smb else ""
+        print(f"{author:{width}} / {d.name}{marker}")
+        if args.dry_run:
+            moved += 1
+            continue
+        if dest.exists():
+            print(f"!  destination already exists: {dest}")
+            failed += 1
+            continue
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(d), str(dest))
+            moved += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"!  {d.name}: {exc}")
+            failed += 1
+
+    verb = "would move" if args.dry_run else "moved"
+
+    pruned = 0
+    if not args.dry_run:
+        # Collapsing empties the old multi-author folders.
+        for d in sorted(out.iterdir(), reverse=True):
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+                pruned += 1
+
+    print(f"\n{verb} {moved}, excluded {excluded}, "
+          f"already filed {skipped}, failed {failed}"
+          + (f", pruned {pruned} empty folder(s)" if pruned else ""))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

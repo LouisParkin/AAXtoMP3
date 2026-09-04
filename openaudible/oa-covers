@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Upgrade folder cover art in converted audiobook directories.
+
+OpenAudible only keeps a 500x500 thumbnail, and that source image is natively
+500px -- Amazon's `_SL1500_` style resize tokens cannot enlarge it.  The real
+high-resolution art (commonly 2400px) is only available from the catalog API,
+which is where audible-cli gets its 1215px covers from.
+
+Plex uses the folder-level cover.jpg as the album poster, so this walks every
+converted book, matches it back to books.json, and replaces cover.jpg when a
+larger image exists.  Safe to re-run: books already at or above the target
+width are skipped.
+
+    oa-covers [--out DIR] [--min-width 1215] [--dry-run] [--match TEXT]
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+
+def norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def common_prefix(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def profile_map() -> dict:
+    cfg = pathlib.Path.home() / ".audible" / "config.toml"
+    out, name = {}, None
+    if not cfg.exists():
+        return out
+    for line in cfg.read_text().splitlines():
+        line = line.strip()
+        m = re.match(r"\[profile\.(.+)\]", line)
+        if m:
+            name = m.group(1)
+            continue
+        m = re.match(r'country_code\s*=\s*"(.+)"', line)
+        if m and name:
+            out[m.group(1).lower()] = name
+    return out
+
+
+def find_entry(name: str, by_norm: dict):
+    """Match a converted directory back to its books.json entry.
+
+    Directory names come from the file's own album tag, which is often a
+    shortened form of OpenAudible's stored title (e.g. album "Dune" vs title
+    "Dune - Book One in the Dune Chronicles"), so a fuzzy ratio alone is not
+    enough -- fall back to an unambiguous prefix match.
+    """
+    key = norm(name)
+    if key in by_norm:
+        return by_norm[key]
+    # An exact prefix relationship is stronger evidence than a fuzzy ratio and
+    # must be tried first: "The Rest of the Robots: Robot Series" scores 0.786
+    # against "The Complete Robot - Robot Series" but only 0.766 against its
+    # own title, so difflib alone picks the wrong book.
+    if len(key) >= 4:
+        hits = {id(b): b for k, b in by_norm.items()
+                if k.startswith(key) or key.startswith(k)}
+        if len(hits) == 1:
+            return next(iter(hits.values()))
+    close = difflib.get_close_matches(key, by_norm.keys(), n=1, cutoff=0.72)
+    if close:
+        return by_norm[close[0]]
+    # Album tags sometimes carry marketing copy instead of the series subtitle,
+    # so neither string contains the other; they still share a long opening run.
+    scored: dict = {}
+    for k, b in by_norm.items():
+        n = common_prefix(key, k)
+        if n >= 12:
+            scored.setdefault(n, {})[id(b)] = b
+    if scored:
+        best = scored[max(scored)]
+        if len(best) == 1:
+            return next(iter(best.values()))
+    return None
+
+
+def book_dirs(root: pathlib.Path) -> list:
+    """Find directories that actually hold audio.
+
+    The library is arranged <Author>/<Title>/, so book folders sit one level
+    below the root -- detecting by content rather than depth also copes with
+    any that remain at the top.
+    """
+    exts = (".m4b", ".m4a", ".mp3")
+    found = []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            kids = list(d.iterdir())
+        except OSError:
+            continue
+        if any(f.is_file() and f.suffix.lower() in exts for f in kids):
+            found.append(d)
+        else:
+            stack.extend(k for k in kids if k.is_dir())
+    return sorted(found)
+
+
+def width_of(path: pathlib.Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=width",
+             "-of", "csv=p=0", f"file:{path}"],
+            capture_output=True, text=True, timeout=60)
+        return int(r.stdout.strip().split(",")[0])
+    except Exception:  # noqa: BLE001 - unreadable art counts as "no art"
+        return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", type=pathlib.Path,
+                    default=pathlib.Path.home() / "audible-remote")
+    ap.add_argument("--out", type=pathlib.Path, default=None)
+    ap.add_argument("--min-width", type=int, default=1215,
+                    help="leave covers alone once they are this wide")
+    ap.add_argument("--match", default=None, help="only books matching this text")
+    ap.add_argument("--force", action="store_true",
+                    help="re-fetch even if the current cover looks big enough")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    out = args.out or (args.root / "Converted")
+
+    books = json.loads((args.root / "books.json").read_text())
+    by_norm = {}
+    for b in books:
+        for key in (b.get("title"), b.get("filename")):
+            if key:
+                by_norm.setdefault(norm(key), b)
+
+    profiles = profile_map()
+    dirs = book_dirs(out)
+    if args.match:
+        dirs = [d for d in dirs if args.match.lower() in d.name.lower()]
+
+    done = skipped = failed = 0
+    for d in dirs:
+        cover = d / "cover.jpg"
+        have = width_of(cover)
+        if have >= args.min_width and not args.force:
+            skipped += 1
+            continue
+
+        entry = find_entry(d.name, by_norm)
+        asin = (entry or {}).get("asin")
+        if not asin:
+            print(f"?  no books.json match: {d.name}")
+            failed += 1
+            continue
+
+        region = (entry.get("region") or "us").lower()
+        profile = profiles.get(region)
+        if not profile:
+            print(f"!  no '{region}' profile for {d.name}")
+            failed += 1
+            continue
+
+        if args.dry_run:
+            print(f"   would upgrade {have or 'none'}px  {d.name} [{asin} {profile}]")
+            done += 1
+            continue
+
+        tmp = d / "cover.jpg.new"
+        floor = 0 if args.force else have + 1
+        r = subprocess.run(
+            ["oa-cover", asin, str(tmp), "--profile", profile,
+             "--min", str(floor)],
+            capture_output=True, text=True)
+        if r.returncode != 0 or not tmp.exists():
+            print(f"!  {d.name}: {r.stderr.strip().splitlines()[-1] if r.stderr.strip() else 'no larger art'}")
+            tmp.unlink(missing_ok=True)
+            failed += 1
+            continue
+
+        new_w = width_of(tmp)
+        if new_w < have or (new_w == have and not args.force):
+            tmp.unlink(missing_ok=True)
+            skipped += 1
+            continue
+        tmp.replace(cover)
+        print(f"OK {have or 0}px -> {new_w}px  {d.name}")
+        done += 1
+
+    print(f"\nupgraded {done}, already good {skipped}, failed {failed}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

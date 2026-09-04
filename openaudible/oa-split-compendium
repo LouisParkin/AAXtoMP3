@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Split an Audible compendium into one book folder per contained work.
+
+Some Audible "collection" titles bundle many complete works into a single
+AAXC file. Splitting them on the container's own chapter track is not always
+possible: for The British Classics Collection that track is corrupt (a 53 h
+gap, junk titles, spans summing to 148 h inside a 224 h file).
+
+The licence response carries the authoritative structure instead --
+`content_metadata.chapter_info` with `is_accurate: true`, nested one level as
+work -> chapters. Offsets are absolute, and each work's children tile exactly
+up to the next work's start, so slicing on them is lossless.
+
+Layout produced:  <out>/<Author>/<Title>/<Title>-NN <Chapter>.m4b
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+# Optional overrides, loaded with --works. Maps a work title exactly as Audible
+# spells it to the author and title you want on disk. Only needed where the
+# automatic ", by <Author>" derivation cannot work, where Audible has a typo, or
+# where you want a spelling that matches folders you already have.
+# See examples/british-classics.works.json.
+WORKS: dict[str, tuple[str, str]] = {}
+
+# Collection-level entries that belong to no single work.
+CREDITS = {"Opening Credits", "Closing Credits"}
+
+# "Emma, by Jane Austen" -> ("Jane Austen", "Emma")
+BY_SUFFIX = re.compile(r"^(?P<title>.+?),\s+by\s+(?P<author>.+)$", re.I)
+
+
+def derive(raw: str) -> tuple[str, str] | None:
+    """Split Audible's "<Title>, by <Author>" convention into its parts."""
+    m = BY_SUFFIX.match(raw.strip())
+    if not m:
+        return None
+    return m.group("author").strip(), m.group("title").strip()
+
+
+def load_works(path: str | None) -> dict[str, tuple[str, str]]:
+    if not path:
+        return {}
+    raw = json.loads(pathlib.Path(path).read_text())
+    return {k: (v["author"], v["title"]) for k, v in raw.items()}
+
+
+
+def sanitize(name: str) -> str:
+    """Make a chapter/# title safe as a path component.
+
+    Mirrors openaudible-convert: '/' would create directories, and the regex
+    metacharacters bite tools that later look files up with `find -regex`.
+    """
+    name = name.replace("/", "-").replace("\\", "-")
+    name = re.sub(r'[:*?"<>|]', "", name)
+    name = re.sub(r"[+\[\]{}^$]", "", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name or "Untitled"
+
+
+def run(cmd: list[str]) -> None:
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"{cmd[0]} failed: {proc.stderr.strip()[-500:]}")
+
+
+def flatten(node: dict) -> list[dict]:
+    """Depth-first flatten. Offsets are absolute, so order by start."""
+    out = [node]
+    for sub in node.get("chapters") or []:
+        out.extend(flatten(sub))
+    return out
+
+
+def build_works(chapter_info: dict) -> list[dict]:
+    """Return one entry per top-level work, with its span and chapter list."""
+    top = chapter_info["chapters"]
+    runtime = chapter_info["runtime_length_ms"]
+    works = []
+    for i, node in enumerate(top):
+        start = node["start_offset_ms"]
+        end = top[i + 1]["start_offset_ms"] if i + 1 < len(top) else runtime
+        chapters = sorted(flatten(node), key=lambda c: c["start_offset_ms"])
+        works.append(
+            {
+                "raw": node.get("title", ""),
+                "start_ms": start,
+                "end_ms": end,
+                "chapters": chapters,
+            }
+        )
+    return works
+
+
+def decrypt(aax: pathlib.Path, voucher: dict, dest: pathlib.Path) -> None:
+    lic = voucher["content_license"]["license_response"]
+    run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-audible_key", lic["key"],
+            "-audible_iv", lic["iv"],
+            "-i", str(aax),
+            "-c", "copy",
+            str(dest),
+        ]
+    )
+
+
+def cut(job: tuple) -> str:
+    src, cover, out_path, start_s, dur_s, tags = job
+    cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start_s:.3f}", "-i", str(src)]
+    if cover:
+        cmd += ["-i", str(cover)]
+    cmd += ["-t", f"{dur_s:.3f}", "-map", "0:a"]
+    if cover:
+        cmd += ["-map", "1:v", "-c:v", "copy", "-disposition:v:0", "attached_pic"]
+    cmd += ["-c:a", "copy"]
+    for key, value in tags.items():
+        cmd += ["-metadata", f"{key}={value}"]
+    cmd += [str(out_path)]
+    run(cmd)
+    return out_path.name
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--voucher", required=True)
+    ap.add_argument("--aax", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--cover")
+    ap.add_argument("--decrypted", help="reuse/keep the decrypted file here")
+    ap.add_argument("--works", help="JSON map of Audible work title -> "
+                                    "{author,title}; see examples/")
+    ap.add_argument("--skip", action="append", default=[],
+                    help="work title (as Audible spells it) to leave out")
+    ap.add_argument("--only", help="process just this work (substring match)")
+    ap.add_argument("--retitle", action="append", default=[],
+                    help="SUBSTRING=New Title, to disambiguate a work the "
+                         "library already holds in another edition")
+    ap.add_argument("--jobs", type=int, default=4)
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    voucher = json.loads(pathlib.Path(args.voucher).read_text())
+    info = voucher["content_license"]["content_metadata"]["chapter_info"]
+    if not info.get("is_accurate"):
+        print("WARNING: chapter_info.is_accurate is false", file=sys.stderr)
+
+    aax = pathlib.Path(args.aax)
+    out_root = pathlib.Path(args.out)
+    cover = pathlib.Path(args.cover) if args.cover else None
+
+    works = build_works(info)
+    total_ms = info["runtime_length_ms"]
+
+    works_map = load_works(args.works)
+    selected = []
+    unmapped = []
+    for work in works:
+        raw = work["raw"]
+        if raw in CREDITS:
+            continue
+        if raw in args.skip:
+            continue
+        if args.only and args.only.lower() not in raw.lower():
+            continue
+        resolved = works_map.get(raw) or derive(raw)
+        if not resolved:
+            unmapped.append(raw)
+            continue
+        work["author"], work["title"] = resolved
+        for rule in args.retitle:
+            frag, _, new = rule.partition("=")
+            if frag.lower() in raw.lower():
+                work["title"] = new
+        selected.append(work)
+
+    if unmapped:
+        print("ERROR: cannot derive an author for these works. Audible only "
+              "spells some of them '<Title>, by <Author>'; add the rest to a "
+              "--works file:", file=sys.stderr)
+        for raw in unmapped:
+            print(f'  "{raw}": {{"author": "?", "title": "?"}},', file=sys.stderr)
+        return 2
+
+    print(f"source runtime : {total_ms / 3600000:.2f} h")
+    print(f"works in file  : {len(works)}  (incl. credits)")
+    print(f"to produce     : {len(selected)} books, "
+          f"{sum(len(w['chapters']) for w in selected)} chapters")
+    print()
+    for work in selected:
+        span = (work["end_ms"] - work["start_ms"]) / 3600000
+        print(f"  {work['author']:<28} {work['title'][:44]:<44} "
+              f"{span:6.2f} h  {len(work['chapters']):3d} ch")
+
+    if args.dry_run:
+        print("\nDRY RUN - nothing written")
+        return 0
+
+    decrypted = pathlib.Path(args.decrypted) if args.decrypted else out_root / ".decrypted.m4a"
+    decrypted.parent.mkdir(parents=True, exist_ok=True)
+    if decrypted.exists() and decrypted.stat().st_size > 0:
+        print(f"\nreusing decrypted file: {decrypted}")
+    else:
+        print(f"\ndecrypting -> {decrypted} ...", flush=True)
+        decrypt(aax, voucher, decrypted)
+    print(f"decrypted size: {decrypted.stat().st_size / 2**30:.2f} GiB", flush=True)
+
+    for work in selected:
+        book_dir = out_root / sanitize(work["author"]) / sanitize(work["title"])
+        book_dir.mkdir(parents=True, exist_ok=True)
+        chapters = work["chapters"]
+        width = max(2, len(str(len(chapters))))
+        jobs, playlist = [], ["#EXTM3U"]
+
+        for idx, chapter in enumerate(chapters, 1):
+            start = chapter["start_offset_ms"]
+            end = start + chapter["length_ms"]
+            if idx == len(chapters):
+                end = work["end_ms"]
+            dur = (end - start) / 1000.0
+            ctitle = chapter.get("title") or f"Chapter {idx}"
+            fname = f"{sanitize(work['title'])}-{idx:0{width}d} {sanitize(ctitle)}.m4b"
+            tags = {
+                "title": ctitle,
+                "album": work["title"],
+                "artist": work["author"],
+                "album_artist": work["author"],
+                "track": f"{idx}/{len(chapters)}",
+                "genre": "Audiobook",
+                "date": "2024",
+                "copyright": "Public Domain (P)2024 SNR Audio",
+                "comment": "From The British Classics Collection - Volume One",
+            }
+            jobs.append((decrypted, cover, book_dir / fname, start / 1000.0, dur, tags))
+            playlist.append(f"#EXTINF:{int(round(dur))},{work['title']} - {ctitle}")
+            playlist.append(fname)
+
+        print(f"\n{work['author']} / {work['title']}  ({len(jobs)} chapters)", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            for done, _ in enumerate(pool.map(cut, jobs), 1):
+                if done % 10 == 0 or done == len(jobs):
+                    print(f"    {done}/{len(jobs)}", flush=True)
+
+        (book_dir / f"{sanitize(work['title'])}.m3u").write_text("\n".join(playlist) + "\n")
+        if cover and cover.exists():
+            shutil.copyfile(cover, book_dir / "cover.jpg")
+
+    print("\ndone")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Convert an OpenAudible library to m4b/mp3 with AAXtoMP3.
+
+OpenAudible stores books in a layout AAXtoMP3 does not understand:
+
+  ~/OpenAudible/
+      books.json                 metadata (chapters here are NESTED - unusable)
+      aax/<Title>.AAX            audio, named .AAX but actually AAXC internally
+      art/<Title>.jpg            cover
+
+Three things have to be fixed up per book:
+
+  1. Extension. AAXtoMP3 decides "is this AAXC?" purely from the file extension,
+     but OpenAudible writes AAXC content into a .AAX name. Staged as .aaxc so the
+     -audible_key/-audible_iv path is used instead of -activation_bytes.
+  2. Voucher. OpenAudible does not persist the per-file key/iv, so one is fetched
+     from Audible via oa-voucher. A fresh licence decrypts an already-downloaded
+     file, so no audio is re-downloaded.
+  3. Chapters. Both books.json and audible-cli's JSON nest "Part -> chapters",
+     and AAXtoMP3 reads only the top level, silently dropping most of the book.
+     Chapters are therefore regenerated from the container's own chapter track
+     (via oa-chapters), which cannot nest.
+
+Nothing is written to the OpenAudible directory; staging uses symlinks.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+STAMP = "AAX_44_128"  # audible-cli-style suffix AAXtoMP3 parses names against
+
+
+def sanitize(name: str) -> str:
+    """Filesystem-safe base name that AAXtoMP3's ${var%-*} trick survives.
+
+    AAXtoMP3 locates the cover with GNU `find -regex`, so any regex
+    metacharacter in the title silently breaks the lookup and aborts the
+    conversion ("20+ Stories" becomes "2" followed by one-or-more zeros).
+    Parentheses are literal in GNU find's default regex flavour and are left
+    alone; the rest are neutralised.
+    """
+    name = re.sub(r'[/\\:*?"<>|+\[\]{}^$]', "_", name).strip().rstrip(".")
+    return re.sub(r"\s+", " ", name)[:150] or "untitled"
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
+
+
+def fstype(path: pathlib.Path) -> str:
+    p = subprocess.run(["findmnt", "-n", "-o", "FSTYPE", "-T", str(path)],
+                       capture_output=True, text=True)
+    return p.stdout.strip()
+
+
+def profile_map() -> dict:
+    """Map an Audible marketplace code to a configured audible-cli profile.
+
+    A licence can only be requested from the marketplace the book was bought
+    in, so a library spanning several regions needs a profile per region.
+    """
+    cfg = pathlib.Path.home() / ".audible" / "config.toml"
+    out, name = {}, None
+    if not cfg.exists():
+        return out
+    for line in cfg.read_text().splitlines():
+        line = line.strip()
+        m = re.match(r"\[profile\.(.+)\]", line)
+        if m:
+            name = m.group(1)
+            continue
+        m = re.match(r'country_code\s*=\s*"(.+)"', line)
+        if m and name:
+            out[m.group(1).lower()] = name
+    return out
+
+
+def is_network(path: pathlib.Path) -> bool:
+    return fstype(path).split(".")[0] in {"fuse", "nfs", "nfs4", "cifs", "smb3", "sshfs"}
+
+
+def move_tree(src: pathlib.Path, dst: pathlib.Path) -> bool:
+    """Move a finished book directory onto (possibly remote) storage."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if shutil.which("rsync"):
+        # No -a: preserving owner/group/perms fails on sshfs and other
+        # foreign-uid mounts, which would abort an otherwise good transfer.
+        rc = subprocess.run(
+            ["rsync", "-rltD", "--no-perms", "--no-owner", "--no-group",
+             "--remove-source-files", "--partial",
+             f"{src}/", f"{dst}/"]).returncode
+        shutil.rmtree(src, ignore_errors=True)
+        return rc == 0
+    try:
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.move(str(src), str(dst))
+        return True
+    except OSError as exc:
+        print(f"  ! move failed: {exc}", file=sys.stderr)
+        return False
+
+
+def load_books(root: pathlib.Path, match: str | None) -> list[dict]:
+    books = json.loads((root / "books.json").read_text())
+    aaxdir, artdir = root / "aax", root / "art"
+    out = []
+    for b in books:
+        fn = b.get("filename")
+        if not fn:
+            continue
+        media = aaxdir / f"{fn}.AAX"
+        if not media.exists():
+            continue
+        if match and match.lower() not in (b.get("title") or "").lower():
+            continue
+        cover = next((p for ext in (".jpg", ".jpeg", ".png")
+                      if (p := artdir / f"{fn}{ext}").exists()), None)
+        out.append({
+            "asin": b.get("asin") or "",
+            "title": b.get("title") or fn,
+            "region": (b.get("region") or "").lower(),
+            "media": media,
+            "cover": cover,
+            "base": sanitize(b.get("title") or fn),
+        })
+    return out
+
+
+def run(cmd: list[str], **kw) -> int:
+    return subprocess.run(cmd, **kw).returncode
+
+
+def stage(book: dict, work: pathlib.Path, profile: str, quality: str) -> pathlib.Path | None:
+    d = work / book["base"]
+    d.mkdir(parents=True, exist_ok=True)
+    base = book["base"]
+
+    media = d / f"{base}-{STAMP}.aaxc"
+    if media.is_symlink() or media.exists():
+        media.unlink()
+    media.symlink_to(book["media"].resolve())
+
+    # AAXtoMP3 requires a cover matching <base>_(NNN).jpg, else it aborts.
+    if book["cover"]:
+        dst = d / f"{base}_(1215).jpg"
+        if not dst.exists():
+            shutil.copyfile(book["cover"], dst)
+    else:
+        print(f"  ! no cover art for {book['title']}", file=sys.stderr)
+        return None
+
+    chapters = d / f"{base}-chapters.json"
+    if not chapters.exists():
+        if run(["oa-chapters", str(media), str(chapters), "--asin", book["asin"]]) != 0:
+            return None
+
+    voucher = d / f"{base}-{STAMP}.voucher"
+    if not voucher.exists():
+        if not book["asin"]:
+            print("  ! no ASIN, cannot fetch voucher", file=sys.stderr)
+            return None
+        if run(["oa-voucher", book["asin"], str(voucher),
+                "--profile", profile, "--quality", quality]) != 0:
+            return None
+        time.sleep(1.5)  # be gentle with the Audible API
+    return media
+
+
+def verify(media: pathlib.Path, voucher: pathlib.Path) -> bool:
+    """Cheap decode of a short span to prove the key/iv actually work."""
+    lic = json.loads(voucher.read_text())["content_license"]["license_response"]
+    p = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin",
+         "-audible_key", lic["key"], "-audible_iv", lic["iv"],
+         "-ss", "60", "-i", str(media), "-t", "5", "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True)
+    m = re.search(r"mean_volume:\s*(-?[\d.]+) dB", p.stderr)
+    return bool(m and float(m.group(1)) > -70)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", type=pathlib.Path,
+                    default=pathlib.Path.home() / "audible-remote")
+    ap.add_argument("--out", type=pathlib.Path,
+                    default=pathlib.Path.home() / "Audiobooks")
+    ap.add_argument("--work", type=pathlib.Path,
+                    default=pathlib.Path.home() / ".cache" / "oa-stage")
+    ap.add_argument("--profile",
+                    help="force one audible-cli profile for every book. By "
+                         "default the profile is chosen per book from its "
+                         "marketplace, since a licence can only be requested "
+                         "from the region the book was bought in.")
+    ap.add_argument("--quality", default="High", choices=["High", "Normal"])
+    ap.add_argument("--format", default="m4b", choices=["m4b", "m4a", "mp3"])
+    ap.add_argument("--single", action="store_true",
+                    help="one file per book instead of one file per chapter")
+    ap.add_argument("--scratch", type=pathlib.Path,
+                    help="build each book here, then move it to --out. Enabled "
+                         "automatically when --out is a network mount, because "
+                         "AAXtoMP3 writes the whole book, reads it back to split "
+                         "it, then writes every chapter -- roughly 3x the traffic.")
+    ap.add_argument("--no-scratch", action="store_true",
+                    help="write directly to --out even if it is a network mount")
+    ap.add_argument("--match", help="only books whose title contains this")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true", help="redo books already marked done")
+    args = ap.parse_args()
+
+    # Python block-buffers stdout when redirected to a file, which hides all
+    # progress and error lines behind the subprocesses' unbuffered output.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except AttributeError:
+            pass
+
+    for tool in ("AAXtoMP3", "oa-voucher", "oa-chapters", "ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            print(f"ERROR: {tool} not on PATH", file=sys.stderr)
+            return 2
+    if not (args.root / "books.json").exists():
+        print(f"ERROR: no books.json under {args.root}", file=sys.stderr)
+        return 2
+
+    args.work.mkdir(parents=True, exist_ok=True)
+    args.out.mkdir(parents=True, exist_ok=True)
+    state = args.work / "done.txt"
+    done = set(state.read_text().split()) if state.exists() else set()
+
+    books = load_books(args.root, args.match)
+    if not args.force:
+        books = [b for b in books if b["asin"] not in done]
+    if args.limit:
+        books = books[: args.limit]
+
+    if not books:
+        print("nothing to do")
+        return 0
+
+    pmap = profile_map()
+    unsupported: dict = {}
+    usable = []
+    for b in books:
+        prof = args.profile or pmap.get(b["region"])
+        if not prof:
+            unsupported.setdefault(b["region"] or "unknown", []).append(b["title"])
+            continue
+        b["profile"] = prof
+        usable.append(b)
+
+    if unsupported:
+        print("\nSKIPPING - no audible-cli profile for these marketplaces:")
+        for region, titles in sorted(unsupported.items()):
+            print(f"  {region.upper()}  ({len(titles)} book(s))")
+            for t in titles:
+                print(f"      {t}")
+        have = ", ".join(f"{k.upper()}={v}" for k, v in sorted(pmap.items())) or "none"
+        print(f"  configured profiles: {have}")
+        print("  add one with:  audible quickstart\n")
+
+    books = usable
+    if not books:
+        print("nothing convertible")
+        return 0
+
+    total = sum(b["media"].stat().st_size for b in books)
+    biggest = max(b["media"].stat().st_size for b in books)
+
+    scratch = args.scratch
+    if scratch is None and not args.no_scratch and is_network(args.out):
+        scratch = args.work / "out"
+    if scratch:
+        scratch.mkdir(parents=True, exist_ok=True)
+
+    print(f"{len(books)} book(s), {human(total)} of source audio")
+    free = shutil.disk_usage(args.out).free
+    print(f"output   {args.out}  ({fstype(args.out) or '?'}, {human(free)} free)")
+    if scratch:
+        sfree = shutil.disk_usage(scratch).free
+        # AAXtoMP3 keeps the whole-book file and the split chapters side by side.
+        need = biggest * 2.2
+        print(f"scratch  {scratch}  ({human(sfree)} free, need ~{human(need)} per book)")
+        if sfree < need:
+            print("WARNING: scratch space looks too small for the largest book",
+                  file=sys.stderr)
+    if free < total:
+        print(f"WARNING: output is stream-copied, so expect ~{human(total)}; "
+              f"free space looks insufficient", file=sys.stderr)
+    if args.dry_run:
+        for b in books:
+            print(f"  {human(b['media'].stat().st_size):>8}  {b['title']}")
+        return 0
+
+    ok = fail = 0
+    for i, b in enumerate(books, 1):
+        print(f"\n[{i}/{len(books)}] {b['title']}")
+        media = stage(b, args.work, b["profile"], args.quality)
+        if not media:
+            fail += 1
+            continue
+        voucher = media.parent / f"{media.stem}.voucher"
+        if not verify(media, voucher):
+            print("  ! voucher did not decrypt this file - skipping", file=sys.stderr)
+            fail += 1
+            continue
+
+        cmd = ["AAXtoMP3", f"-e:{args.format}",
+               "-t", str(args.out), "-D", "$title",
+               "--use-audible-cli-data"]
+        if not args.single:
+            cmd.append("-c")
+        cmd.append(str(media))
+
+        if scratch:
+            pen = scratch / "current"
+            shutil.rmtree(pen, ignore_errors=True)
+            pen.mkdir(parents=True)
+            cmd[cmd.index("-t") + 1] = str(pen)
+
+        rc = run(cmd)
+        if rc == 0 and scratch:
+            produced = [d for d in pen.iterdir() if d.is_dir()]
+            if not produced:
+                print("  ! nothing produced in scratch", file=sys.stderr)
+                rc = 1
+            else:
+                for d in produced:
+                    print(f"  moving {d.name} -> {args.out}")
+                    if not move_tree(d, args.out / d.name):
+                        rc = 1
+            shutil.rmtree(pen, ignore_errors=True)
+
+        if rc == 0:
+            ok += 1
+            done.add(b["asin"])
+            state.write_text("\n".join(sorted(done)) + "\n")
+            shutil.rmtree(media.parent, ignore_errors=True)
+        else:
+            fail += 1
+            print("  ! AAXtoMP3 failed", file=sys.stderr)
+
+    print(f"\ndone: {ok} converted, {fail} failed")
+    return 1 if fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

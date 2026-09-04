@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Fetch the highest-resolution cover art Audible has for an ASIN.
+
+OpenAudible stores only the 500px thumbnail (`image_url` ends in `_SL500_`),
+and that source image is natively 500x500 -- resize tokens cannot enlarge it.
+The larger art lives behind the catalog API, which is what audible-cli asks
+for when it writes 1215px covers.
+
+    oa-cover ASIN OUTFILE [--profile PROFILE] [--min 501]
+
+Exits 0 on success, 2 if nothing better than --min was available.
+"""
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import sys
+import urllib.request
+
+import audible
+
+SIZES = [3000, 2400, 1800, 1500, 1215, 900, 800, 500]
+
+
+def auth_path(profile: str) -> pathlib.Path:
+    """Resolve a profile's auth file through config.toml.
+
+    The auth file name need not match the profile name: `audible quickstart`
+    writes profile `audible_us` pointing at `audible-us.json`.
+    """
+    cfg_dir = pathlib.Path.home() / ".audible"
+    cfg = cfg_dir / "config.toml"
+    if cfg.exists():
+        name = None
+        for line in cfg.read_text().splitlines():
+            line = line.strip()
+            m = re.match(r"\[profile\.(.+)\]", line)
+            if m:
+                name = m.group(1)
+                continue
+            m = re.match(r'auth_file\s*=\s*"(.+)"', line)
+            if m and name == profile:
+                return cfg_dir / m.group(1)
+    return cfg_dir / f"{profile}.json"
+
+
+def fetch_images(asin: str, profile: str) -> dict:
+    auth_file = auth_path(profile)
+    if not auth_file.exists():
+        print(f"ERROR: no auth file {auth_file}", file=sys.stderr)
+        return {}
+    auth = audible.Authenticator.from_file(auth_file)
+    try:
+        with audible.Client(auth) as client:
+            resp = client.get(
+                f"1.0/catalog/products/{asin}",
+                response_groups="media",
+                image_sizes=",".join(str(s) for s in SIZES),
+            )
+    except Exception as exc:  # noqa: BLE001 - report and fall through
+        print(f"ERROR: catalog lookup failed for {asin}: {exc}", file=sys.stderr)
+        return {}
+    return (resp.get("product") or {}).get("product_images") or {}
+
+
+def default_profile() -> str | None:
+    """Fall back to audible-cli's own primary_profile rather than guessing."""
+    cfg = pathlib.Path.home() / ".audible" / "config.toml"
+    if not cfg.exists():
+        return None
+    profiles = []
+    for line in cfg.read_text().splitlines():
+        line = line.strip()
+        m = re.match(r'primary_profile\s*=\s*"(.+)"', line)
+        if m:
+            return m.group(1)
+        m = re.match(r"\[profile\.(.+)\]", line)
+        if m:
+            profiles.append(m.group(1))
+    return profiles[0] if len(profiles) == 1 else None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("asin")
+    ap.add_argument("outfile", type=pathlib.Path)
+    ap.add_argument("--profile", default=None,
+                    help="audible-cli profile; defaults to primary_profile "
+                         "from ~/.audible/config.toml")
+    ap.add_argument("--min", type=int, default=501,
+                    help="only write if the image is wider than this")
+    args = ap.parse_args()
+
+    profile = args.profile or default_profile()
+    if not profile:
+        print("ERROR: no --profile given and no primary_profile in "
+              "~/.audible/config.toml", file=sys.stderr)
+        return 2
+
+    images = fetch_images(args.asin, profile)
+    if not images:
+        return 2
+
+    # Keys come back as strings; pick the largest on offer.
+    best = max(images, key=lambda k: int(k))
+    if int(best) < args.min:
+        print(f"{args.asin}: best available is {best}px, not > {args.min}px",
+              file=sys.stderr)
+        return 2
+
+    url = images[best]
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r:
+            data = r.read()
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: download failed {url}: {exc}", file=sys.stderr)
+        return 2
+    if not data.startswith(b"\xff\xd8"):
+        print(f"ERROR: {url} did not return a JPEG", file=sys.stderr)
+        return 2
+
+    args.outfile.parent.mkdir(parents=True, exist_ok=True)
+    args.outfile.write_bytes(data)
+    print(f"{args.asin}: wrote {best}px cover ({len(data)} bytes) -> {args.outfile}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
