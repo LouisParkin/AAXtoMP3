@@ -4,3 +4,6 @@ ACTIVATION
 *jpg
 *json
 Audiobook/*
+
+# ... but the shipped example data must be tracked
+!openaudible/examples/*.json
