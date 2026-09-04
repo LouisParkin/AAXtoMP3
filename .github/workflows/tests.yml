@@ -65,3 +65,36 @@ jobs:
           reported="$(bash AAXtoMP3 --version | head -1 | awk '{print $2}')"
           echo "tag=$tag reported=$reported"
           [ "$tag" = "$reported" ] || { echo "AAXTOMP3_VERSION does not match the tag" >&2; exit 1; }
+
+  release:
+    name: build and attach release archives
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the archives
+        run: .github/scripts/build-archives.sh --version "${GITHUB_REF_NAME}" --out dist
+
+      - name: Verify the archives
+        run: |
+          cd dist
+          sha256sum -c SHA256SUMS
+          for a in *.tar.gz; do
+            root="$(tar tzf "$a" | head -1)"
+            [ "$root" = "AAXtoMP3-${GITHUB_REF_NAME}/" ] || { echo "$a has root $root" >&2; exit 1; }
+          done
+          # the packaged script must be executable and must run
+          tar xzf "AAXtoMP3-${GITHUB_REF_NAME}-slim.tar.gz"
+          "AAXtoMP3-${GITHUB_REF_NAME}/AAXtoMP3" --version
+
+      - name: Attach them to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            dist/AAXtoMP3-*.tar.gz dist/AAXtoMP3-*.zip dist/SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" --clobber
