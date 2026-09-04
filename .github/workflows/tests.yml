@@ -1,0 +1,48 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: chapter and cover-art tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+
+      - name: Report versions
+        run: |
+          bash --version | head -1
+          jq --version
+          sed --version | head -1
+
+      - name: Syntax-check the shell scripts
+        run: |
+          bash -n AAXtoMP3
+          bash -n interactiveAAXtoMP3
+          bash -n tests/test-nested-chapters.sh
+          bash -n openaudible/flatten-chapters
+
+      - name: Syntax-check the Python tools
+        run: |
+          for f in openaudible/oa-* openaudible/openaudible-convert; do
+            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f"
+          done
+
+      - name: Validate the shipped example data
+        run: jq -e 'type == "object" and (length > 0)' openaudible/examples/*.json > /dev/null
+
+      - name: Run the test suite
+        run: ./tests/test-nested-chapters.sh
