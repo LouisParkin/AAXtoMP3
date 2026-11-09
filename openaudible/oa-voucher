@@ -17,6 +17,7 @@ import json
 import pathlib
 import re
 import sys
+import time
 
 import audible
 from audible.aescipher import decrypt_voucher_from_licenserequest
@@ -103,10 +104,19 @@ def main() -> int:
 
     # Access tokens last an hour; a stale one otherwise surfaces as an opaque
     # API error. Refresh in place and persist so the next run starts valid.
-    try:
-        if auth.access_token_expired:
+    def refresh(force: bool = False) -> None:
+        expires = getattr(auth, "expires", None)
+        stale = force or bool(getattr(auth, "access_token_expired", False))
+        if not stale and expires is not None:
+            # Renew slightly early: a long conversion run can otherwise cross
+            # the expiry mid-flight.
+            stale = (float(expires) - time.time()) < 300
+        if stale:
             auth.refresh_access_token()
-            auth.to_file()
+            auth.to_file(auth_file)
+
+    try:
+        refresh()
     except Exception as exc:  # noqa: BLE001
         print(f"ERROR: could not refresh access token for profile "
               f"{profile}: {exc}", file=sys.stderr)
@@ -114,12 +124,21 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    try:
+    def request_licence():
         with audible.Client(auth) as client:
-            lr = client.post(f"content/{args.asin}/licenserequest", body=body)
-    except Exception as exc:  # noqa: BLE001 - surface API/auth errors verbatim
-        print(f"ERROR: licence request failed for {args.asin}: {exc}", file=sys.stderr)
-        return 1
+            return client.post(f"content/{args.asin}/licenserequest", body=body)
+
+    try:
+        lr = request_licence()
+    except Exception:  # noqa: BLE001
+        # An expired token can present as a transport failure rather than an
+        # auth error, so force one refresh and retry before giving up.
+        try:
+            refresh(force=True)
+            lr = request_licence()
+        except Exception as exc:  # noqa: BLE001 - surface API/auth errors verbatim
+            print(f"ERROR: licence request failed for {args.asin}: {exc}", file=sys.stderr)
+            return 1
 
     # A refused licence still returns HTTP 200 with no license_response, so
     # report Audible's own reasons rather than dying on a bare KeyError.
