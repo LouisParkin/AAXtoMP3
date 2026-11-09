@@ -102,19 +102,33 @@ check "unpatched filter emits only top-level nodes" "$old" "3"
 
 echo
 echo "cover lookup regex escaping"
+# Pull the escaping expression straight out of the script under test, for the
+# same reason as the jq filter above: a copy duplicated here would silently
+# drift from the code it covers -- which is exactly how the parenthesised-title
+# bug below survived.
+ESC=$(grep -F 'extra_title_escaped=' "$SCRIPT" | head -1 | sed "s/.*\$SED '//; s/').*//")
+[ -n "$ESC" ] || { echo "could not extract title escaping from $SCRIPT"; exit 1; }
+escape_title() { printf '%s' "$1" | sed "$ESC"; }
+
 covdir=$(mktemp -d)
+# "+" is a quantifier when bare, so it has to be escaped.
 title='Collection - Volume One: 20+ Stories'
 touch "$covdir/${title}_(1215).jpg"
 raw=$(find "$covdir" -maxdepth 1 -regex ".*/${title}_([0-9]+)\.jpg" | wc -l)
-esc=$(printf '%s' "$title" | sed 's/[][\\.*^$+?(){}|]/\\&/g')
-fix=$(find "$covdir" -maxdepth 1 -regex ".*/${esc}_([0-9]+)\.jpg" | wc -l)
+fix=$(find "$covdir" -maxdepth 1 -regex ".*/$(escape_title "$title")_([0-9]+)\.jpg" | wc -l)
+# findutils' default regex type is Emacs syntax, where "(" is literal when bare
+# and *becomes* a group when backslashed. Escaping it therefore breaks ordinary
+# titles -- this one is a real book that failed to convert.
+paren='Eric - (Discworld Novel 9)'
+touch "$covdir/${paren}_(1215).jpg"
+par=$(find "$covdir" -maxdepth 1 -regex ".*/$(escape_title "$paren")_([0-9]+)\.jpg" | wc -l)
 plain='Mostly Harmless'
 touch "$covdir/${plain}_(1215).jpg"
-pesc=$(printf '%s' "$plain" | sed 's/[][\\.*^$+?(){}|]/\\&/g')
-reg=$(find "$covdir" -maxdepth 1 -regex ".*/${pesc}_([0-9]+)\.jpg" | wc -l)
+reg=$(find "$covdir" -maxdepth 1 -regex ".*/$(escape_title "$plain")_([0-9]+)\.jpg" | wc -l)
 rm -rf "$covdir"
 check "unescaped title fails to match (the bug)"   "$raw" "0"
 check "escaped title matches"                      "$fix" "1"
+check "parenthesised title matches"                "$par" "1"
 check "plain title still matches (regression)"     "$reg" "1"
 
 echo
