@@ -100,12 +100,44 @@ def main() -> int:
 
     body = dict(LICENSE_BODY, quality=args.quality)
     auth = audible.Authenticator.from_file(auth_file)
+
+    # Access tokens last an hour; a stale one otherwise surfaces as an opaque
+    # API error. Refresh in place and persist so the next run starts valid.
+    try:
+        if auth.access_token_expired:
+            auth.refresh_access_token()
+            auth.to_file()
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: could not refresh access token for profile "
+              f"{profile}: {exc}", file=sys.stderr)
+        print("       re-register the device with: oa-reauth --region <cc>",
+              file=sys.stderr)
+        return 2
+
     try:
         with audible.Client(auth) as client:
             lr = client.post(f"content/{args.asin}/licenserequest", body=body)
-        voucher = decrypt_voucher_from_licenserequest(auth, lr)
     except Exception as exc:  # noqa: BLE001 - surface API/auth errors verbatim
         print(f"ERROR: licence request failed for {args.asin}: {exc}", file=sys.stderr)
+        return 1
+
+    # A refused licence still returns HTTP 200 with no license_response, so
+    # report Audible's own reasons rather than dying on a bare KeyError.
+    lic = lr.get("content_license") or {}
+    status = lic.get("status_code")
+    if status != "Granted" or "license_response" not in lic:
+        print(f"ERROR: licence {status or 'missing'} for {args.asin}: "
+              f"{lic.get('message') or 'no message'}", file=sys.stderr)
+        for reason in lic.get("license_denial_reasons") or []:
+            print(f"       - {reason.get('rejectionReason')}: "
+                  f"{reason.get('message')}", file=sys.stderr)
+        return 1
+
+    try:
+        voucher = decrypt_voucher_from_licenserequest(auth, lr)
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: could not decrypt voucher for {args.asin}: {exc}",
+              file=sys.stderr)
         return 1
 
     if not voucher.get("key") or not voucher.get("iv"):
