@@ -484,10 +484,13 @@ validate_extra_files() {
   # The title is interpolated into a find(1) regex, so any regex metacharacter
   # in the book title would be interpreted rather than matched -- "20+ Stories"
   # turns "0+" into a quantifier and the cover is then silently not found.
-  # Escape the title only; the trailing _([0-9]+) is our own pattern, and under
-  # findutils' default regex type its parentheses are literal and match the
-  # literal parentheses in "<title>_(1215).jpg".
-  extra_title_escaped="$(printf '%s' "${extra_title##*/}" | $SED 's/[][\\.*^$+?(){}|]/\\&/g')"
+  # findutils' default regex type is Emacs syntax, where "(", ")", "{", "}" and
+  # "|" are literal when bare and *become* operators when backslashed, so those
+  # must be left alone -- escaping them breaks any title containing parentheses,
+  # e.g. "Eric - (Discworld Novel 9)". Only escape what is special when bare.
+  # The trailing _([0-9]+) is our own pattern and relies on that same rule: its
+  # bare parentheses match the literal ones in "<title>_(1215).jpg".
+  extra_title_escaped="$(printf '%s' "${extra_title##*/}" | $SED 's/[][\\.*^$+?]/\\&/g')"
   extra_find_command='$FIND "${extra_dirname}" -maxdepth 1 -regex ".*/${extra_title_escaped}_([0-9]+)\.jpg"'
   # We want the output of the find command, we will turn errexit on later
   set +e errexit
@@ -589,10 +592,17 @@ JQEOF
       | $SED 's@[:/]@@g' >> "$metadata_file"
 
     # Guard against silently losing audio: the parsed chapters must cover the
-    # runtime the metadata itself declares.
+    # runtime the metadata itself declares. Derive the covered span from the
+    # chapter JSON rather than re-parsing "$metadata_file" -- the ':' characters
+    # are stripped from that file just above, so a pattern written against the
+    # pre-sed text can never match. That made this guard both useless and fatal:
+    # the failing grep aborted the whole run under errexit/pipefail.
     declared_ms=$(jq -r '.content_metadata.chapter_info.runtime_length_ms // empty' "${extra_chapter_file}")
     if [[ -n "${declared_ms}" ]]; then
-      covered=$($GREP -Po 'end: \K[0-9.]+' "$metadata_file" | sort -g | tail -1)
+      covered=$(jq -r "${flatten_chapters_jq}"'
+        [.content_metadata.chapter_info.chapters[] | flatten_chapters]
+        | map(.start_offset_ms + .length_ms)
+        | if length == 0 then empty else (max / 1000) end' "${extra_chapter_file}")
       if [[ -n "${covered}" ]] && awk -v a="${covered}" -v b="${declared_ms}" \
            'BEGIN{exit !((b/1000 - a) > 5 || (a - b/1000) > 5)}'; then
         log "WARNING: chapter data covers ${covered}s but runtime_length_ms declares $((declared_ms/1000))s"
@@ -1027,7 +1037,11 @@ do
     fi
   fi
 
-  if [ -f "${cover_file}" ]; then
+  # In chaptered mode the whole-book file has already been split and removed,
+  # and each chapter file carries its own cover, so there is nothing left here
+  # to tag. Without the -f check mp4art fails on the missing file and, under
+  # errexit, takes down an otherwise complete conversion.
+  if [ -f "${cover_file}" ] && [ -f "${output_file}" ]; then
     log "Adding cover art"
     # FFMPEG does not support MPEG-4 containers fully #
     if [ "${container}" == "mp4" ] ; then
